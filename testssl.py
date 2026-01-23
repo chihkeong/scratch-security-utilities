@@ -1,20 +1,18 @@
-from cryptography.x509 import NameOID
-#legacy sslyze 2.14
-from sslyze.concurrent_scanner import ConcurrentScanner, PluginRaisedExceptionScanResult
-from sslyze.plugins.certificate_info_plugin import CertificateInfoScanCommand
-
-from sslyze.server_connectivity_tester import ServerConnectivityTester, ServerConnectivityError
-from sslyze.ssl_settings import TlsWrappedProtocolEnum
-from sslyze.plugins.openssl_cipher_suites_plugin import Tlsv12ScanCommand, Tlsv10ScanCommand, Tlsv11ScanCommand
-from sslyze.plugins.openssl_cipher_suites_plugin import *
-from sslyze.synchronous_scanner import SynchronousScanner
 import argparse
 import socket
+
 import requests
 
 from colorama import Fore, Back, Style, init
-from colored import fore
-from sty import fg, bg, ef, rs
+
+from sslyze import (
+    Scanner,
+    ServerScanRequest,
+    ServerNetworkLocation,
+    ServerScanStatusEnum,
+    ScanCommandAttemptStatusEnum,
+)
+from sslyze.errors import ServerHostnameCouldNotBeResolved
 
 def main():
     init(autoreset=True)
@@ -78,244 +76,199 @@ def check_headers(purl):
             if value == (response.headers[res_header]):
                 print(Fore.LIGHTGREEN_EX + f"{res_header} = {response.headers[res_header]}")
             else:
-                print(Fore.RED + "X-Frame-Options should be SAMEORIGIN")
+                print(Fore.RED + f"{res_header} should be {value}, got {response.headers[res_header]}")
         else:
             print(Fore.RED + f"Warning!! Missing {res_header} --->> {Headers[res_header]}")
 
-    if 'max-age' in response.headers['Strict-Transport-Security'] or 'includeSubDomains ; preload' in response.headers[
-        'Strict-Transport-Security']:
-        print(
-            Fore.LIGHTGREEN_EX + f"Passed Strict-Transport-Security and value is {response.headers['Strict-Transport-Security']}")
+    if 'Strict-Transport-Security' in response.headers:
+        hsts_value = response.headers['Strict-Transport-Security']
+        if 'max-age' in hsts_value or 'includeSubDomains' in hsts_value or 'preload' in hsts_value:
+            print(Fore.LIGHTGREEN_EX + f"Passed Strict-Transport-Security and value is {hsts_value}")
+        else:
+            print(Fore.RED + "Strict-Transport-Security should have value  max-age=31536000 ; includeSubDomains ; preload")
     else:
-        print(Fore.RED + "Strict-Transport-Security should have value  max-age=31536000 ; includeSubDomains ; preload")
+        print(Fore.RED + "Warning!! Missing Strict-Transport-Security header")
 
-    if 'Set-Cookie' not in response.headers:
-        print(Fore.RED + "Warning!! Missing Set-Cookie")
-    else:
-        if 'Secure' in response.headers['Set-Cookie']:
+    if 'Set-Cookie' in response.headers:
+        cookie_value = response.headers['Set-Cookie']
+        if 'Secure' in cookie_value:
             print(Fore.LIGHTGREEN_EX + "Found Secure in Set-Cookie !")
         else:
             print(Fore.RED + "Secure missing in Set-Cookie!")
 
-        if 'HTTPOnly' in response.headers['Set-Cookie']:
+        if 'HTTPOnly' in cookie_value:
             print(Fore.LIGHTGREEN_EX + "Found HTTPOnly in Set-Cookie !")
         else:
             print(Fore.RED + "HTTPOnly missing in Set-Cookie!")
+    else:
+        print(Fore.RED + "Warning!! No Set-Cookie header present")
 
     print(f"\n[INFO] Dumping headers now \n")
     print(Fore.YELLOW + str(response.headers))
 
 
-def demo_server_connectivity_tester():
-    try:
-
-        server_tester = ServerConnectivityTester(
-            hostname='www.mas.gov.sg',
-            port=443,
-            tls_wrapped_protocol=TlsWrappedProtocolEnum.STARTTLS_SMTP)
-        print(f'\nTesting connectivity with {server_tester.hostname}:{server_tester.port}...')
-        server_info = server_tester.perform()
-    except ServerConnectivityError as e:
-        # Could not establish an SSL connection to the server
-        raise RuntimeError(f'Could not connect to {e.server_info.hostname}: {e.error_message}')
-
-    return server_info
-
-
 def demo_synchronous_scanner(url):
     SERVERS_TO_SCAN = []
     if url is not None:
-        ttuple = (url, 443, TlsWrappedProtocolEnum.HTTPS)
+        ttuple = (url, 443)
         SERVERS_TO_SCAN.append(ttuple)
-    # Run one scan command to list the server's TLS 1.0 cipher suites
     else:
         SERVERS_TO_SCAN = [
-            ('www.mas.gov.sg', 443, TlsWrappedProtocolEnum.HTTPS),
-            ('www.moneysense.gov.sg', 443, TlsWrappedProtocolEnum.HTTPS),
-            ('eservices.mas.gov.sg', 443, TlsWrappedProtocolEnum.HTTPS),
-            ('masnet.mas.gov.sg', 443, TlsWrappedProtocolEnum.HTTPS),
-            # ('vodafone.de', 443, TlsWrappedProtocolEnum.HTTPS),  # This one is vulnerable as of 12/17/2017
+            ('www.mas.gov.sg', 443),
+            ('www.moneysense.gov.sg', 443),
+            ('eservices.mas.gov.sg', 443),
+            ('masnet.mas.gov.sg', 443),
         ]
 
     BAD_Cipher = ["CBC", "CBC3", "3DES", "RC2", "RC4", "DES", "MD4", "MD5", "EXP", "EXP1024", "AH", "ADH", "aNULL",
                   "eNULL", "SEED", "IDE"]
-    for hostname, port, protocol in SERVERS_TO_SCAN:
+
+    for hostname, port in SERVERS_TO_SCAN:
         try:
-            server_tester = ServerConnectivityTester(
-                hostname=hostname,
-                port=port,
-                tls_wrapped_protocol=protocol
+            scan_request = ServerScanRequest(
+                server_location=ServerNetworkLocation(hostname=hostname, port=port)
             )
-            print(
-                Fore.YELLOW + f'\n[INFO] Checking supported ciphers of {server_tester.hostname}:{server_tester.port}...\n')
-            server_info = server_tester.perform()
-        except ServerConnectivityError as e:
-            # Could not establish an SSL connection to the server
-            print(Fore.LIGHTRED_EX + f'[ERROR] Could not connect to {e.server_info.hostname}: {e.error_message}')
+
+            print(Fore.YELLOW + f'\n[INFO] Checking supported ciphers of {hostname}:{port}...\n')
+
+            scanner = Scanner()
+            scanner.queue_scans([scan_request])
+
+            for server_scan_result in scanner.get_results():
+                if server_scan_result.scan_status == ServerScanStatusEnum.ERROR_NO_CONNECTIVITY:
+                    print(Fore.LIGHTRED_EX + f'[ERROR] Could not connect to {hostname}: {server_scan_result.connectivity_error_trace}')
+                    exit(-1)
+
+                assert server_scan_result.scan_result
+
+                tls12_attempt = server_scan_result.scan_result.tls_1_2_cipher_suites
+                if tls12_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED:
+                    tls12_result = tls12_attempt.result
+                    if len(tls12_result.accepted_cipher_suites) > 0:
+                        print(Fore.LIGHTGREEN_EX + "Supports TLS 1.2 ")
+                    else:
+                        print("No TLS 1.2 support.")
+
+                    for cipher_suite in tls12_result.accepted_cipher_suites:
+                        BAD = False
+                        for item in BAD_Cipher:
+                            if item in cipher_suite.cipher_suite.name:
+                                BAD = True
+                                break
+                        if BAD:
+                            print(Fore.LIGHTRED_EX + f' {cipher_suite.cipher_suite.name}')
+                        else:
+                            print(f' {cipher_suite.cipher_suite.name}')
+
+                tls13_attempt = server_scan_result.scan_result.tls_1_3_cipher_suites
+                if tls13_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED:
+                    tls13_result = tls13_attempt.result
+                    print(Fore.YELLOW + "\n[INFO] Testing TLS 1.3 ciphers now ...")
+                    if len(tls13_result.accepted_cipher_suites) > 0:
+                        print(Fore.LIGHTGREEN_EX + "Supports TLS 1.3 ")
+                    else:
+                        print("No TLS 1.3 support.")
+
+                    for cipher_suite in tls13_result.accepted_cipher_suites:
+                        BAD = False
+                        for item in BAD_Cipher:
+                            if item in cipher_suite.cipher_suite.name:
+                                BAD = True
+                                break
+                        if BAD:
+                            print(Fore.LIGHTRED_EX + f' {cipher_suite.cipher_suite.name}')
+                        else:
+                            print(f' {cipher_suite.cipher_suite.name}')
+
+                tls11_attempt = server_scan_result.scan_result.tls_1_1_cipher_suites
+                if tls11_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED:
+                    print(Fore.YELLOW + "\n[INFO] Testing TLS 1.1 ciphers now ...")
+                    tls11_result = tls11_attempt.result
+                    if len(tls11_result.accepted_cipher_suites) > 0:
+                        print(Fore.LIGHTRED_EX + "Supports TLS 1.1 ")
+                    else:
+                        print(Fore.LIGHTGREEN_EX + "No TLS 1.1 supported.")
+
+                    for cipher_suite in tls11_result.accepted_cipher_suites:
+                        BAD = False
+                        for item in BAD_Cipher:
+                            if item in cipher_suite.cipher_suite.name:
+                                BAD = True
+                                break
+                        if BAD:
+                            print(Fore.LIGHTRED_EX + f' {cipher_suite.cipher_suite.name}')
+                        else:
+                            print(f' {cipher_suite.cipher_suite.name}')
+
+                tls10_attempt = server_scan_result.scan_result.tls_1_0_cipher_suites
+                if tls10_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED:
+                    print(Fore.YELLOW + "\n[INFO] Testing TLS 1.0 ciphers now ...")
+                    tls10_result = tls10_attempt.result
+                    if len(tls10_result.accepted_cipher_suites) > 0:
+                        print(Fore.LIGHTRED_EX + "Oh my TLS 1.0 supported .....")
+                    else:
+                        print(Fore.LIGHTGREEN_EX + "No TLS 1.0 supported.")
+
+                    for cipher_suite in tls10_result.accepted_cipher_suites:
+                        BAD = False
+                        for item in BAD_Cipher:
+                            if item in cipher_suite.cipher_suite.name:
+                                BAD = True
+                                break
+                        if BAD:
+                            print(Fore.LIGHTRED_EX + f' {cipher_suite.cipher_suite.name}')
+                        else:
+                            print(f' {cipher_suite.cipher_suite.name}')
+
+                ssl2_attempt = server_scan_result.scan_result.ssl_2_0_cipher_suites
+                if ssl2_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED:
+                    print(Fore.YELLOW + "\n[INFO] Testing SSL 2.0 ciphers now ...")
+                    ssl2_result = ssl2_attempt.result
+                    if len(ssl2_result.accepted_cipher_suites) > 0:
+                        print(Fore.LIGHTRED_EX + "Oh my SSL 2.0 supported .....")
+                    else:
+                        print(Fore.LIGHTGREEN_EX + "No SSL 2.0 supported.")
+
+                    for cipher_suite in ssl2_result.accepted_cipher_suites:
+                        BAD = False
+                        for item in BAD_Cipher:
+                            if item in cipher_suite.cipher_suite.name:
+                                BAD = True
+                                break
+                        if BAD:
+                            print(Fore.LIGHTRED_EX + f' {cipher_suite.cipher_suite.name}')
+                        else:
+                            print(f' {cipher_suite.cipher_suite.name}')
+
+                ssl3_attempt = server_scan_result.scan_result.ssl_3_0_cipher_suites
+                if ssl3_attempt.status == ScanCommandAttemptStatusEnum.COMPLETED:
+                    print(Fore.YELLOW + "\n[INFO] Testing SSL 3.0 ciphers now ...")
+                    ssl3_result = ssl3_attempt.result
+                    if len(ssl3_result.accepted_cipher_suites) > 0:
+                        print(Fore.LIGHTRED_EX + "Oh my SSL 3.0 supported .....")
+                    else:
+                        print(Fore.LIGHTGREEN_EX + "No SSL 3.0 supported.")
+
+                    for cipher_suite in ssl3_result.accepted_cipher_suites:
+                        BAD = False
+                        for item in BAD_Cipher:
+                            if item in cipher_suite.cipher_suite.name:
+                                BAD = True
+                                break
+                        if BAD:
+                            print(Fore.LIGHTRED_EX + f' {cipher_suite.cipher_suite.name}')
+                        else:
+                            print(f' {cipher_suite.cipher_suite.name}')
+
+        except ServerHostnameCouldNotBeResolved as e:
+            print(Fore.LIGHTRED_EX + f'[ERROR] Could not resolve hostname {hostname}: {e}')
             exit(-1)
-        except socket.gaierror as e:
-            print(Fore.LIGHTRED_EX + f'[ERROR] Wrong hostname/IP format  {e.server_info.hostname}: {e.error_message}')
+        except Exception as e:
+            print(Fore.LIGHTRED_EX + f'[ERROR] Unexpected error: {e}')
             exit(-1)
-        command = Tlsv12ScanCommand()
-
-        synchronous_scanner = SynchronousScanner()
-
-        scan_result = synchronous_scanner.run_scan_command(server_info, command)
-        BAD = False
-        if len(scan_result.accepted_cipher_list) > 0:
-            print(Fore.LIGHTGREEN_EX + "Supports TLS 1.2 ")
-        else:
-            print("No TLS 1.2 support.")
-        for cipher in scan_result.accepted_cipher_list:
-            for item in BAD_Cipher:
-                if item in cipher.name:
-                    BAD = True
-                    break
-            if BAD:
-                print(Fore.LIGHTRED_EX + f' {cipher.name}')
-            else:
-                print(f' {cipher.name}')
-            BAD = False
-
-        command = Tlsv11ScanCommand()
-        print(Fore.YELLOW + "\n[INFO] Testing TLS 1.1 ciphers now ...")
-        scan_result = synchronous_scanner.run_scan_command(server_info, command)
-        if len(scan_result.accepted_cipher_list) > 0:
-            print(Fore.LIGHTRED_EX + "Supports TLS 1.1 ")
-        else:
-            print(Fore.LIGHTGREEN_EX + "No TLS 1.1 supported.")
-
-        for cipher in scan_result.accepted_cipher_list:
-            for item in BAD_Cipher:
-                if item in cipher.name:
-                    BAD = True
-                    break
-            if BAD:
-                print(Fore.LIGHTRED_EX + f' {cipher.name}')
-            else:
-                print(f' {cipher.name}')
-            BAD = False
-
-        command = Tlsv10ScanCommand()
-        print(Fore.YELLOW + "\n[INFO] Testing TLS 1.0 ciphers now ...")
-        scan_result = synchronous_scanner.run_scan_command(server_info, command)
-        if len(scan_result.accepted_cipher_list) > 0:
-            print(Fore.LIGHTRED_EX + "Oh my TLS 1.0 supported ..... ")
-        else:
-            print(Fore.LIGHTGREEN_EX + "No TLS 1.0 supported.")
-
-        for cipher in scan_result.accepted_cipher_list:
-            for item in BAD_Cipher:
-                if item in cipher.name:
-                    BAD = True
-                    break
-            if BAD:
-                print(Fore.LIGHTRED_EX + f' {cipher.name}')
-            else:
-                print(f' {cipher.name}')
-            BAD = False
-
-        command = Sslv20ScanCommand()
-        print(Fore.YELLOW + "\n[INFO] Testing SSL 2.0 ciphers now ...")
-        scan_result = synchronous_scanner.run_scan_command(server_info, command)
-        if len(scan_result.accepted_cipher_list) > 0:
-            print(Fore.LIGHTRED_EX + "Oh my SSL 2.0 supported ..... ")
-        else:
-            print(Fore.LIGHTGREEN_EX + "No SSL 2.0 supported.")
-
-        for cipher in scan_result.accepted_cipher_list:
-            for item in BAD_Cipher:
-                if item in cipher.name:
-                    BAD = True
-                    break
-            if BAD:
-                print(Fore.LIGHTRED_EX + f' {cipher.name}')
-            else:
-                print(f' {cipher.name}')
-            BAD = False
-
-        command = Sslv30ScanCommand()
-        print(Fore.YELLOW + "\n[INFO] Testing SSL 3.0 ciphers now ...")
-        scan_result = synchronous_scanner.run_scan_command(server_info, command)
-        if len(scan_result.accepted_cipher_list) > 0:
-            print(Fore.LIGHTRED_EX + "Oh my SSL 3.0 supported ..... ")
-        else:
-            print(Fore.LIGHTGREEN_EX + "No SSL 3.0 supported.")
-
-        for cipher in scan_result.accepted_cipher_list:
-            for item in BAD_Cipher:
-                if item in cipher.name:
-                    BAD = True
-                    break
-            if BAD:
-                print(Fore.LIGHTRED_EX + f' {cipher.name}')
-            else:
-                print(f' {cipher.name}')
-            BAD = False
 
     return
 
 
-def demo_concurrent_scanner():
-    # Setup the server to scan and ensure it is online/reachable
-    server_info = demo_server_connectivity_tester()
-
-    # Run multiple scan commands concurrently. It is much faster than the SynchronousScanner
-    concurrent_scanner = ConcurrentScanner()
-
-    # Queue some scan commands
-    print('\nQueuing some commands...')
-    concurrent_scanner.queue_scan_command(server_info, Tlsv12ScanCommand())
-    concurrent_scanner.queue_scan_command(server_info, CertificateInfoScanCommand())
-
-    # Process the results
-    print('\nProcessing results...')
-    for scan_result in concurrent_scanner.get_results():
-        # All scan results have the corresponding scan_command and server_info as an attribute
-        print(
-            f'\nReceived result for "{scan_result.scan_command.get_title()}" 'f'on {scan_result.server_info.hostname}')
-
-        # A scan command can fail (as a bug); it is returned as a PluginRaisedExceptionResult
-        if isinstance(scan_result, PluginRaisedExceptionScanResult):
-            raise RuntimeError(f'Scan command failed: {scan_result.scan_command.get_title()}')
-
-        # Each scan result has attributes with the information yo're looking for
-        # All these attributes are documented within each scan command's module
-        if isinstance(scan_result.scan_command, Tlsv12ScanCommand):
-            for cipher in scan_result.accepted_cipher_list:
-                print(f' {cipher.name}')
-
-        elif isinstance(scan_result.scan_command, CertificateInfoScanCommand):
-            # Print the Common Names within the verified certificate chain
-            if not scan_result.verified_certificate_chain:
-                print('Error: certificate chain is not trusted!')
-            else:
-                print('Certificate chain common names:')
-                for cert in scan_result.verified_certificate_chain:
-                    cert_common_names = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
-                    print(f' {cert_common_names[0].value}')
-
-
 if __name__ == '__main__':
     main()
-
-
-
-# from sslyze.synchronous_scanner import SynchronousScanner
-# from sslyze.plugins.openssl_cipher_suites_plugin import Tlsv12ScanCommand, Tlsv11ScanCommand, Tlsv10ScanCommand, Sslv30ScanCommand, Sslv20ScanCommand
-# from sslyze.server_connectivity import ServerConnectivityInfo, ServerConnectivityError
-#
-# server_info = ServerConnectivityInfo(hostname='www.test.de', port=443)
-# server_info.test_connectivity_to_server()
-#
-# sslv20 = { 'version': 'SSLv20', 'command': Sslv20ScanCommand() }
-# sslv30 = { 'version': 'SSLv30', 'command': Sslv30ScanCommand() }
-# tlsv10 = { 'version': 'TLSv10', 'command': Tlsv10ScanCommand() }
-# tlsv11 = { 'version': 'TLSv11', 'command': Tlsv11ScanCommand() }
-# tlsv12 = { 'version': 'TLSv12', 'command': Tlsv12ScanCommand() }
-#
-# while True:
-# for protocol in [sslv20, sslv30, tlsv10, tlsv11, tlsv12]:
-# scanner = SynchronousScanner(network_timeout=2, network_retries=2)
-# scan_result = scanner.run_scan_command(server_info, protocol['command'])
-# print(scan_result)
