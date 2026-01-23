@@ -1,4 +1,5 @@
 from cryptography.x509 import NameOID
+#legacy sslyze 2.14
 from sslyze.concurrent_scanner import ConcurrentScanner, PluginRaisedExceptionScanResult
 from sslyze.plugins.certificate_info_plugin import CertificateInfoScanCommand
 
@@ -88,15 +89,18 @@ def check_headers(purl):
     else:
         print(Fore.RED + "Strict-Transport-Security should have value  max-age=31536000 ; includeSubDomains ; preload")
 
-    if 'Secure' in response.headers['Set-Cookie']:
-        print(Fore.LIGHTGREEN_EX + "Found Secure in Set-Cookie !")
+    if 'Set-Cookie' not in response.headers:
+        print(Fore.RED + "Warning!! Missing Set-Cookie")
     else:
-        print(Fore.RED + "Secure missing in Set-Cookie!")
+        if 'Secure' in response.headers['Set-Cookie']:
+            print(Fore.LIGHTGREEN_EX + "Found Secure in Set-Cookie !")
+        else:
+            print(Fore.RED + "Secure missing in Set-Cookie!")
 
-    if 'HTTPOnly' in response.headers['Set-Cookie']:
-        print(Fore.LIGHTGREEN_EX + "Found HTTPOnly in Set-Cookie !")
-    else:
-        print(Fore.RED + "HTTPOnly missing in Set-Cookie!")
+        if 'HTTPOnly' in response.headers['Set-Cookie']:
+            print(Fore.LIGHTGREEN_EX + "Found HTTPOnly in Set-Cookie !")
+        else:
+            print(Fore.RED + "HTTPOnly missing in Set-Cookie!")
 
     print(f"\n[INFO] Dumping headers now \n")
     print(Fore.YELLOW + str(response.headers))
