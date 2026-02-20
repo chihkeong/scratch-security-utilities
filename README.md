@@ -1,2 +1,3 @@
-# scratch_security_utilities
-Collection of adhoc quick utilities
+# Scratch Security Utilities
+
+Collection of ad-hoc quick utilities for security research and analysis.
