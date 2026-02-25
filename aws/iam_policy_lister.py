@@ -1,40 +1,100 @@
 """
-AWS IAM Policy Lister
-Lists all IAM policies with their attachments (users, roles, groups)
-Exports to JSON, CSV, and HTML formats
+AWS IAM Policy & Role Access Analyzer
+This script:
+- Lists all IAM policies attached to users, groups, and roles.
+- Shows who can assume each role (including group membership).
+- Tracks where permissions come from (direct user or group).
+- Outputs structured data to JSON, CSV, and HTML for analysis.
 
-Version: 2.0
-Original file: testAWSv2.py
+Features:
+- Uses policy cache to reduce redundant API calls.
+- Shows users in groups that can assume roles.
+- Returns structured output (JSON/CSV/HTML).
+- No threading - keeps execution simple and predictable.
+
+Version: 3.0
+Original file: testAWS3.py
 """
 
 import boto3
 import json
 from botocore.exceptions import ClientError
-import csv
-from jinja2 import Template
 from fnmatch import fnmatch
+import csv
+from jinja2 import Template  # For HTML rendering
 
 
 # Use the 'cloudpt' AWS profile
 session = boto3.Session(profile_name='cloudpt')
-
 # Initialize the IAM client using the session
 iam = session.client('iam')
 
+# Toggle enhanced output showing why users can assume roles.
+# When True, shows {"user": {"source": "direct"}} or {"source": "group:GroupName"}.
+ENHANCED_USER_SOURCE = True
+
+# Global policy cache to avoid redundant API calls
+POLICY_CACHE = {}
+
+
+def get_cached_policy(policy_arn):
+    """
+    Returns the default version of the IAM policy document from cache or AWS API.
+    This reduces repeated network calls for the same policy.
+    :param policy_arn: ARN of the IAM policy
+    :return: Policy document or empty dict on error
+    """
+    if policy_arn in POLICY_CACHE:
+        return POLICY_CACHE[policy_arn]
+    try:
+        # Get policy metadata
+        policy_meta = iam.get_policy(PolicyArn=policy_arn)
+        version_id = policy_meta['Policy']['DefaultVersionId']
+        # Get actual policy document
+        policy_doc = iam.get_policy_version(
+            PolicyArn=policy_arn,
+            VersionId=version_id
+        )['PolicyVersion']['Document']
+        # Store in cache
+        POLICY_CACHE[policy_arn] = policy_doc
+        return policy_doc
+    except Exception as e:
+        print(f"[ERROR] Could not fetch policy {policy_arn}: {e}")
+        return {}
+
+
+def get_group_members(group_name):
+    """
+    Returns list of user names in the given IAM group.
+    Used to enrich metadata block with group membership details.
+    :param group_name: Name of the IAM group
+    :return: List of usernames
+    """
+    try:
+        paginator = iam.get_paginator('get_group')
+        members = []
+        for page in paginator.paginate(GroupName=group_name):
+            for user in page.get('Users', []):
+                members.append(user['UserName'])
+        return list(set(members))  # Ensure unique usernames
+    except Exception as e:
+        print(f"[ERROR] Could not fetch members for group '{group_name}': {e}")
+        return []
+
+
 def get_role_assume_info(role_name):
     """
-    Given a single role name, return detailed info about:
+    Given a single role name, returns detailed info about:
     - Trust policy
     - Who is allowed to assume it (users, groups, services, cross-account, federated)
     - Whether inline/wildcard permissions apply
-
     :param role_name: Name of IAM role
-    :return: dict
+    :return: Dict containing role assume info
     """
     session = boto3.Session(profile_name='cloudpt')
     iam = session.client('iam')
-
-    current_account_id = session.client('sts').get_caller_identity()['Account']
+    sts = session.client('sts')
+    current_account_id = sts.get_caller_identity()['Account']
 
     try:
         # Get role data
@@ -47,7 +107,6 @@ def get_role_assume_info(role_name):
         cross_accounts = []
         services = []
         federated = []
-
         statements = trust_policy.get("Statement", [])
         for stmt in statements:
             principal = stmt.get("Principal", {})
@@ -55,19 +114,16 @@ def get_role_assume_info(role_name):
                 aws_principal = principal.get("AWS")
                 service_principal = principal.get("Service")
                 federated_principal = principal.get("Federated")
-
                 if aws_principal:
                     if isinstance(aws_principal, str):
                         trusted_principals.append(aws_principal)
                     elif isinstance(aws_principal, list):
                         trusted_principals.extend(aws_principal)
-
                 if service_principal:
                     if isinstance(service_principal, str):
                         services.append(service_principal)
                     elif isinstance(service_principal, list):
                         services.extend(service_principal)
-
                 if federated_principal:
                     if isinstance(federated_principal, str):
                         federated.append(federated_principal)
@@ -86,28 +142,37 @@ def get_role_assume_info(role_name):
                     cross_accounts.append(arn)
 
         # Find users/groups with sts:AssumeRole permission
-        users_allowed = set()
+        users_allowed = {}  # { username: { "source": "..."} }
         groups_allowed = set()
-        resolved_users = set()  # All users (via direct or group policy)
+        resolved_users = {}  # Merged dict of all users with sources
 
         def check_policy_statements(policy_doc, resource_arn, matched_users=None, matched_groups=None):
+            """
+            Helper function to scan IAM policy documents for sts:AssumeRole permissions.
+            Tracks which user/group gets permission and where it came from.
+            """
             for statement in policy_doc.get('Statement', []):
-                if statement.get('Effect') == 'Allow' and 'sts:AssumeRole' in statement.get('Action', []):
-                    resource = statement.get('Resource', '')
-                    if isinstance(resource, str):
-                        if fnmatch(resource_arn, resource):
-                            if matched_users:
-                                matched_users.add(user_name)
-                            if matched_groups:
-                                matched_groups.add(group_name)
-                    elif isinstance(resource, list):
-                        for r in resource:
-                            if fnmatch(resource_arn, r):
-                                if matched_users:
-                                    matched_users.add(user_name)
-                                if matched_groups:
-                                    matched_groups.add(group_name)
+                action = statement.get('Action', [])
+                if isinstance(action, str):
+                    action = [action]
+                elif not isinstance(action, list):
+                    action = []
 
+                resource = statement.get('Resource', [])
+                if isinstance(resource, str):
+                    resource = [resource]
+                elif not isinstance(resource, list):
+                    resource = []
+
+                if statement.get('Effect') == 'Allow' and 'sts:AssumeRole' in action:
+                    for r in resource:
+                        if fnmatch(resource_arn, r):
+                            if matched_users and user_name:
+                                matched_users[user_name] = {"source": f"direct (policy: {policy_arn})"}
+                            if matched_groups and group_name:
+                                matched_groups.add(group_name)
+
+        global user_name, group_name
         # Check users
         user_paginator = iam.get_paginator('list_users')
         for page in user_paginator.paginate():
@@ -118,11 +183,8 @@ def get_role_assume_info(role_name):
                 for pol_page in policy_paginator.paginate(UserName=user_name):
                     for policy in pol_page['AttachedPolicies']:
                         policy_arn = policy['PolicyArn']
-                        doc = iam.get_policy(PolicyArn=policy_arn)
-                        version = doc['Policy']['DefaultVersionId']
-                        policy_doc = iam.get_policy_version(PolicyArn=policy_arn, VersionId=version)['PolicyVersion']['Document']
+                        policy_doc = get_cached_policy(policy_arn)
                         check_policy_statements(policy_doc, role_arn, matched_users=users_allowed)
-
                 # Inline policies
                 inline_paginator = iam.get_paginator('list_user_policies')
                 for inline_page in inline_paginator.paginate(UserName=user_name):
@@ -140,11 +202,8 @@ def get_role_assume_info(role_name):
                 for pol_page in policy_paginator.paginate(GroupName=group_name):
                     for policy in pol_page['AttachedPolicies']:
                         policy_arn = policy['PolicyArn']
-                        doc = iam.get_policy(PolicyArn=policy_arn)
-                        version = doc['Policy']['DefaultVersionId']
-                        policy_doc = iam.get_policy_version(PolicyArn=policy_arn, VersionId=version)['PolicyVersion']['Document']
+                        policy_doc = get_cached_policy(policy_arn)
                         check_policy_statements(policy_doc, role_arn, matched_groups=groups_allowed)
-
                 # Inline policies
                 inline_paginator = iam.get_paginator('list_group_policies')
                 for inline_page in inline_paginator.paginate(GroupName=group_name):
@@ -157,12 +216,15 @@ def get_role_assume_info(role_name):
                 for user in user_in_group.get('Users', []):
                     user_in_group_name = user['UserName']
                     if group_name in groups_allowed:
-                        resolved_users.add(user_in_group_name)
+                        resolved_users[user_in_group_name] = {
+                            "source": f"group:{group_name}"
+                        }
 
-        # Combine resolved users from direct and group policies
-        for u in users_allowed:
-            resolved_users.add(u)
+        # Merge direct-assigned users
+        for user, info in users_allowed.items():
+            resolved_users[user] = info
 
+        # Final format
         return {
             "role_name": role_name,
             "role_arn": role_arn,
@@ -171,11 +233,10 @@ def get_role_assume_info(role_name):
             "cross_accounts": list(set(cross_accounts)),
             "services": list(set(services)),
             "federated": list(set(federated)),
-            "allowed_users_direct": list(users_allowed),
+            "allowed_users_direct": list(users_allowed.keys()),
             "allowed_groups": list(groups_allowed),
-            "resolved_users": list(resolved_users)
+            "resolved_users": resolved_users
         }
-
     except Exception as e:
         print(f"[ERROR] Could not retrieve info for role '{role_name}': {e}")
         return {"role_name": role_name, "error": str(e)}
@@ -183,23 +244,28 @@ def get_role_assume_info(role_name):
 
 def get_roles_assume_info(role_names):
     """
-    Given a list of role names, returns info for each.
+    Given a list of role names, returns assume info for each.
+    Uses simple loop (no threading).
+    :param role_names: List of role names
+    :return: Dict mapping role name to role info
     """
     results = {}
     for role_name in role_names:
         result = get_role_assume_info(role_name)
         results[role_name] = result
+    return results
+
 
 def get_policy_details(policy_arn):
+    """
+    Gets the latest version of an IAM policy document.
+    :param policy_arn: ARN of the IAM policy
+    :return: Policy document or empty dict
+    """
     try:
-        # Get the default version of the policy
         policy = iam.get_policy(PolicyArn=policy_arn)
         default_version_id = policy['Policy']['DefaultVersionId']
-
-        policy_version = iam.get_policy_version(
-            PolicyArn=policy_arn,
-            VersionId=default_version_id
-        )
+        policy_version = iam.get_policy_version(PolicyArn=policy_arn, VersionId=default_version_id)
         return policy_version['PolicyVersion']['Document']
     except ClientError as e:
         print(f"[ERROR] Unable to retrieve policy document: {e}")
@@ -207,48 +273,91 @@ def get_policy_details(policy_arn):
 
 
 def list_entities_for_policy(policy_arn):
+    """
+    Lists users, roles, and groups that are attached to the given IAM policy.
+    Also includes group members when available.
+    :param policy_arn: ARN of the IAM policy
+    :return: Dict of users, roles, and groups (with members)
+    """
     users = []
     roles = []
-    groups = []
-
+    groups = {}
     paginator = iam.get_paginator('list_entities_for_policy')
     for page in paginator.paginate(PolicyArn=policy_arn):
         users.extend(page.get('PolicyUsers', []))
         roles.extend(page.get('PolicyRoles', []))
-        groups.extend(page.get('PolicyGroups', []))
-
+        for group in page.get('PolicyGroups', []):
+            group_name = group['GroupName']
+            groups[group_name] = get_group_members(group_name)
     return {
         'users': [u['UserName'] for u in users],
         'roles': [r['RoleName'] for r in roles],
-        'groups': [g['GroupName'] for g in groups]
+        'groups': groups
     }
 
 
 def save_to_json(data):
+    """Saves output to JSON file"""
     with open("output.json", "w") as f:
         json.dump(data, f, indent=4, default=str)
     print("✅ Saved output.json")
 
 
 def save_to_csv(data):
-    headers = ['Policy Name', 'ARN', 'Attached Users', 'Attached Roles', 'Attached Groups', 'Policy Document']
+    """Saves output to CSV file"""
+    headers = [
+        'Policy Name',
+        'ARN',
+        'Attached Users',
+        'Attached Groups',
+        'Roles (Who Can Assume)',
+        'Policy Document'
+    ]
     with open("output.csv", "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
         for item in data:
             meta = item["metadata"]
+            role_assume_info = meta.get("Role Assume Info", {})
+            # Extract role assume info
+            roles_info = []
+            for role_name, role_data in role_assume_info.items():
+                if "error" in role_data:
+                    roles_info.append(f"{role_name} (Error: {role_data['error']})")
+                    continue
+                entities = []
+                if role_data.get("resolved_users"):
+                    entities.append("Users:\n" + "\n".join([
+                        f"  {user} ({details['source']})"
+                        for user, details in role_data["resolved_users"].items()
+                    ]))
+                if role_data.get("services"):
+                    entities.append("Services:\n" + "\n".join([f"  {service}" for service in role_data["services"]]))
+                if role_data.get("cross_accounts"):
+                    entities.append("Cross-Accounts:\n" + "\n".join([f"  {account}" for account in role_data["cross_accounts"]]))
+                if role_data.get("federated"):
+                    entities.append("Federated Identities:\n" + "\n".join([f"  {identity}" for identity in role_data["federated"]]))
+                if entities:
+                    roles_info.append(f"{role_name}:\n" + "\n".join(entities))
+                else:
+                    roles_info.append(f"{role_name}: No entities allowed")
+            # Write row
             writer.writerow({
                 "Policy Name": meta["Policy Name"],
                 "ARN": meta["ARN"],
                 "Attached Users": ", ".join(meta["Attached To"]["Users"]),
-                "Attached Roles": ", ".join(meta["Attached To"]["Roles"]),
-                "Attached Groups": ", ".join(meta["Attached To"]["Groups"]),
+                "Attached Groups": ", ".join([
+                    f"{group}({len(users)})"
+                    for group, users in meta["Attached To"]["Groups"].items()
+                ]),
+                "Roles (Who Can Assume)": "\n\n".join(roles_info),
                 "Policy Document": json.dumps(item["policy_document"], indent=2)
             })
     print("✅ Saved output.csv")
 
 
 def save_to_html(data):
+    """Saves output to HTML file with expandable JSON view"""
     html_template = """
     <!DOCTYPE html>
     <html lang="en">
@@ -266,7 +375,6 @@ def save_to_html(data):
                 background-color: #f7f7f7;
                 border: 1px solid #ccc;
                 padding: 10px;
-                margin-top: 10px;
                 display: none;
             }
             .toggle-btn {
@@ -284,8 +392,8 @@ def save_to_html(data):
                     <th>Policy Name</th>
                     <th>ARN</th>
                     <th>Users</th>
-                    <th>Roles</th>
                     <th>Groups</th>
+                    <th>Roles (Who Can Assume)</th>
                     <th>Policy Document</th>
                 </tr>
             </thead>
@@ -295,8 +403,45 @@ def save_to_html(data):
                     <td>{{ item.metadata['Policy Name'] }}</td>
                     <td>{{ item.metadata['ARN'] }}</td>
                     <td>{{ item.metadata['Attached To']['Users'] | join(', ') }}</td>
-                    <td>{{ item.metadata['Attached To']['Roles'] | join(', ') }}</td>
-                    <td>{{ item.metadata['Attached To']['Groups'] | join(', ') }}</td>
+                    <td>
+                        {% for group, members in item.metadata['Attached To']['Groups'].items() %}
+                        <strong>{{ group }}</strong>: {{ members | join(', ') }}<br>
+                        {% endfor %}
+                    </td>
+                    <td>
+                        {% for role_name, role_data in item.metadata['Role Assume Info'].items() %}
+                        {% if 'error' in role_data %}
+                            {{ role_name }} (Error: {{ role_data['error'] }})
+                        {% else %}
+                            {{ role_name }}:<br>
+                            {% if role_data['resolved_users'] %}
+                                Users:<br>
+                                {% for user, details in role_data['resolved_users'].items() %}
+                                    &nbsp;&nbsp;{{ user }} ({{ details['source'] }})<br>
+                                {% endfor %}
+                            {% endif %}
+                            {% if role_data['services'] %}
+                                Services:<br>
+                                {% for service in role_data['services'] %}
+                                    &nbsp;&nbsp;{{ service }}<br>
+                                {% endfor %}
+                            {% endif %}
+                            {% if role_data['cross_accounts'] %}
+                                Cross-Accounts:<br>
+                                {% for account in role_data['cross_accounts'] %}
+                                    &nbsp;&nbsp;{{ account }}<br>
+                                {% endfor %}
+                            {% endif %}
+                            {% if role_data['federated'] %}
+                                Federated Identities:<br>
+                                {% for identity in role_data['federated'] %}
+                                    &nbsp;&nbsp;{{ identity }}<br>
+                                {% endfor %}
+                            {% endif %}
+                        {% endif %}
+                        <br>
+                        {% endfor %}
+                    </td>
                     <td>
                         <span class="toggle-btn" onclick="togglePolicy(this)">Show</span>
                         <div class="policy-json">{{ item.policy_document_json }}</div>
@@ -305,7 +450,6 @@ def save_to_html(data):
                 {% endfor %}
             </tbody>
         </table>
-
         <script>
             function togglePolicy(button) {
                 const container = button.nextElementSibling;
@@ -317,54 +461,49 @@ def save_to_html(data):
     </body>
     </html>
     """
-
-    # Convert each policy document to pretty-printed JSON string
     processed_data = []
     for item in data:
         processed_data.append({
             "metadata": item["metadata"],
             "policy_document_json": json.dumps(item["policy_document"], indent=2)
         })
-
     template = Template(html_template)
     rendered_html = template.render(data=processed_data)
-
     with open("output.html", "w", encoding="utf-8") as f:
         f.write(rendered_html)
     print("✅ Saved output.html")
 
 
 def main():
+    """
+    Main entry point of the script. Does the following:
+    - Fetches all IAM policies.
+    - Filters only those attached to users, groups, or roles.
+    - For each, collects policy document and role assume info.
+    - Exports final output to JSON, CSV, and HTML.
+    """
     output_data = []
-
     print("🔍 Fetching all IAM policies...")
     paginator = iam.get_paginator('list_policies')
-    policy_pages = paginator.paginate(Scope='All')
     all_policies = []
-    for page in policy_pages:
+    for page in paginator.paginate(Scope='All'):
         all_policies.extend(page['Policies'])
-
     total_policies = len(all_policies)
-    print(f"📊 Found {total_policies} IAM policies. Filtering only attached ones...\n")
-
+    print(f"📊 Found {total_policies} IAM policies. Filtering only attached ones...")
     count = 0
     for i, policy in enumerate(all_policies, 1):
         policy_name = policy['PolicyName']
         policy_arn = policy['Arn']
-
         # Get attached entities
         entities = list_entities_for_policy(policy_arn)
-
-        # Skip if not attached to anything
+        # Skip unattached policies
         if not any(entities.values()):
             if i % 50 == 0 or i == total_policies:
                 print(f"⏳ Processed {i}/{total_policies} policies... (skipping unattached)")
             continue
-
         count += 1
         if count % 10 == 0 or i == total_policies:
             print(f"⏳ Processed {i}/{total_policies} policies... found {count} attached so far.")
-
         # Build metadata block
         metadata_block = {
             "Policy Name": policy_name,
@@ -373,27 +512,26 @@ def main():
                 "Users": entities['users'],
                 "Roles": entities['roles'],
                 "Groups": entities['groups']
-            }
+            },
+            "Role Assume Info": {}
         }
-
+        # If the policy is attached to one or more roles, fetch their assume info
+        if entities['roles']:
+            role_assume_data = get_roles_assume_info(entities['roles'])
+            metadata_block["Role Assume Info"] = role_assume_data
         # Get policy document
         policy_doc = get_policy_details(policy_arn)
-
         # Combine metadata and policy document
         full_entry = {
             "metadata": metadata_block,
             "policy_document": policy_doc
         }
-
         output_data.append(full_entry)
-
     print(f"\n📦 Collected {len(output_data)} attached policies.")
-
     # Save to multiple formats
     save_to_json(output_data)
     save_to_csv(output_data)
     save_to_html(output_data)
-
     print(f"\n✅ Successfully wrote {len(output_data)} policies to 3 files:")
     print("   - output.json (structured)")
     print("   - output.csv (tabular with policy document as JSON string)")
