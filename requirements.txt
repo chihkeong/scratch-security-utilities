@@ -1,0 +1,9 @@
+# AWS Security Tools
+boto3>=1.26.0
+colorama>=0.4.6
+
+# SSL/TLS Scanner
+# Add SSL scanner dependencies here
+
+# Common
+python-dateutil>=2.8.0
