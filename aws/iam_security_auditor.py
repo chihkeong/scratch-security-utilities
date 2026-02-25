@@ -34,7 +34,16 @@ def get_users_in_group(group_name, iam):
             users.append(user['UserName'])
     return users
 
-def check_policies(policies):
+def check_policies(policies, iam, user_name, all_roles, assumed_roles):
+    """Check policies for sts:AssumeRole permissions and track which roles can be assumed.
+    
+    Args:
+        policies: List of policy dictionaries to check
+        iam: IAM client instance
+        user_name: Name of the user being checked
+        all_roles: Dict of all roles for lookup
+        assumed_roles: Set to populate with assumable role names
+    """
     for policy in policies:
         try:
             policy_version_id = iam.get_policy(PolicyArn=policy['PolicyArn'])['Policy']['DefaultVersionId']
@@ -70,21 +79,28 @@ def check_policies(policies):
         except ClientError as e:
             print(Fore.LIGHTRED_EX + f"  [!] Error retrieving policy for user {user_name}: {e}")
 def user_can_assume_roles(user_name, all_roles, iam):
-    """Return a list of roles the user can assume based on their policies."""
+    """Return a list of roles the user can assume based on their policies.
+    
+    Args:
+        user_name: Name of the user to check
+        all_roles: Dict of all roles for lookup
+        iam: IAM client instance
+        
+    Returns:
+        List of role names the user can assume
+    """
     assumed_roles = set()
-
-
 
     # Check attached user policies
     attached_policies = iam.list_attached_user_policies(UserName=user_name)['AttachedPolicies']
-    check_policies(attached_policies)
+    check_policies(attached_policies, iam, user_name, all_roles, assumed_roles)
 
     # Check group policies for each group the user is in
     groups = iam.list_groups_for_user(UserName=user_name)['Groups']
     for group in groups:
         group_name = group['GroupName']
         attached_policies = iam.list_attached_group_policies(GroupName=group_name)['AttachedPolicies']
-        check_policies(attached_policies)
+        check_policies(attached_policies, iam, user_name, all_roles, assumed_roles)
 
     return list(assumed_roles)
 
