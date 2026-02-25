@@ -1,19 +1,20 @@
 """
 AWS IAM Policy & Role Access Analyzer
 This script:
-- Lists all IAM policies attached to users, groups, and roles.
-- Shows who can assume each role (including group membership).
-- Tracks where permissions come from (direct user or group).
-- Outputs structured data to JSON, CSV, and HTML for analysis.
+- Lists all IAM policies attached to users, groups, and roles
+- Shows who can assume each role (including group membership)
+- Tracks where permissions come from (direct user or group)
+- Outputs structured data to JSON, CSV, and HTML for analysis
 
 Features:
-- Uses policy cache to reduce redundant API calls.
-- Shows users in groups that can assume roles.
-- Returns structured output (JSON/CSV/HTML).
-- No threading - keeps execution simple and predictable.
+- Uses policy cache to reduce redundant API calls
+- Shows users in groups that can assume roles
+- Returns structured output (JSON/CSV/HTML)
+- No threading - keeps execution simple and predictable
+- File-based caching for faster re-runs
 
-Version: 3.0
-Original file: testAWS3.py
+Version: 4.0
+Original file: testAWS4.py
 """
 
 import boto3
@@ -21,16 +22,19 @@ import json
 from botocore.exceptions import ClientError
 from fnmatch import fnmatch
 import csv
-from jinja2 import Template  # For HTML rendering
+from jinja2 import Template  # Needed for save_to_html
+import os  # For file-based caching
 
+# File to cache list of policies with attachments
+POLICY_CACHE_FILE = "attached_policies_cache.json"
 
 # Use the 'cloudpt' AWS profile
 session = boto3.Session(profile_name='cloudpt')
 # Initialize the IAM client using the session
 iam = session.client('iam')
 
-# Toggle enhanced output showing why users can assume roles.
-# When True, shows {"user": {"source": "direct"}} or {"source": "group:GroupName"}.
+# Toggle enhanced output showing why users can assume roles
+# When True, shows {"user": {"source": "direct"}} or {"source": "group:GroupName"}
 ENHANCED_USER_SOURCE = True
 
 # Global policy cache to avoid redundant API calls
@@ -42,7 +46,7 @@ def get_cached_policy(policy_arn):
     Returns the default version of the IAM policy document from cache or AWS API.
     This reduces repeated network calls for the same policy.
     :param policy_arn: ARN of the IAM policy
-    :return: Policy document or empty dict on error
+    :return: policy document or empty dict on error
     """
     if policy_arn in POLICY_CACHE:
         return POLICY_CACHE[policy_arn]
@@ -76,7 +80,7 @@ def get_group_members(group_name):
         for page in paginator.paginate(GroupName=group_name):
             for user in page.get('Users', []):
                 members.append(user['UserName'])
-        return list(set(members))  # Ensure unique usernames
+        return list(set(members))
     except Exception as e:
         print(f"[ERROR] Could not fetch members for group '{group_name}': {e}")
         return []
@@ -89,12 +93,11 @@ def get_role_assume_info(role_name):
     - Who is allowed to assume it (users, groups, services, cross-account, federated)
     - Whether inline/wildcard permissions apply
     :param role_name: Name of IAM role
-    :return: Dict containing role assume info
+    :return: dict
     """
     session = boto3.Session(profile_name='cloudpt')
     iam = session.client('iam')
-    sts = session.client('sts')
-    current_account_id = sts.get_caller_identity()['Account']
+    current_account_id = session.client('sts').get_caller_identity()['Account']
 
     try:
         # Get role data
@@ -152,25 +155,21 @@ def get_role_assume_info(role_name):
             Tracks which user/group gets permission and where it came from.
             """
             for statement in policy_doc.get('Statement', []):
-                action = statement.get('Action', [])
-                if isinstance(action, str):
-                    action = [action]
-                elif not isinstance(action, list):
-                    action = []
-
-                resource = statement.get('Resource', [])
-                if isinstance(resource, str):
-                    resource = [resource]
-                elif not isinstance(resource, list):
-                    resource = []
-
-                if statement.get('Effect') == 'Allow' and 'sts:AssumeRole' in action:
-                    for r in resource:
-                        if fnmatch(resource_arn, r):
-                            if matched_users and user_name:
+                if statement.get('Effect') == 'Allow' and 'sts:AssumeRole' in statement.get('Action', []):
+                    resource = statement.get('Resource', '')
+                    if isinstance(resource, str):
+                        if fnmatch(resource_arn, resource):
+                            if matched_users:
                                 matched_users[user_name] = {"source": f"direct (policy: {policy_arn})"}
-                            if matched_groups and group_name:
+                            if matched_groups:
                                 matched_groups.add(group_name)
+                    elif isinstance(resource, list):
+                        for r in resource:
+                            if fnmatch(resource_arn, r):
+                                if matched_users:
+                                    matched_users[user_name] = {"source": f"direct (policy: {policy_arn})"}
+                                if matched_groups:
+                                    matched_groups.add(group_name)
 
         global user_name, group_name
         # Check users
@@ -210,7 +209,6 @@ def get_role_assume_info(role_name):
                     for policy_name in inline_page['PolicyNames']:
                         policy_doc = iam.get_group_policy(GroupName=group_name, PolicyName=policy_name)['PolicyDocument']
                         check_policy_statements(policy_doc, role_arn, matched_groups=groups_allowed)
-
                 # Get users in this group
                 user_in_group = iam.get_group(GroupName=group_name)
                 for user in user_in_group.get('Users', []):
@@ -225,6 +223,9 @@ def get_role_assume_info(role_name):
             resolved_users[user] = info
 
         # Final format
+        if not ENHANCED_USER_SOURCE:
+            resolved_users = list(resolved_users.keys())
+
         return {
             "role_name": role_name,
             "role_arn": role_arn,
@@ -294,6 +295,32 @@ def list_entities_for_policy(policy_arn):
         'roles': [r['RoleName'] for r in roles],
         'groups': groups
     }
+
+
+def save_attached_policies_to_file(policy_list):
+    """
+    Saves list of policy ARNs to a JSON file for faster reuse.
+    :param policy_list: List of policy ARNs
+    """
+    with open(POLICY_CACHE_FILE, 'w') as f:
+        json.dump({"policies": policy_list}, f, indent=2)
+    print(f"✅ Saved {len(policy_list)} attached policy ARNs to {POLICY_CACHE_FILE}")
+
+
+def load_attached_policies_from_file():
+    """
+    Loads list of policy ARNs from cache file if it exists.
+    :return: List of policy ARNs or None if file doesn't exist
+    """
+    if os.path.exists(POLICY_CACHE_FILE):
+        try:
+            with open(POLICY_CACHE_FILE, 'r') as f:
+                data = json.load(f)
+                print(f"✅ Loaded {len(data['policies'])} policies from {POLICY_CACHE_FILE}")
+                return data.get("policies", [])
+        except Exception as e:
+            print(f"[ERROR] Could not load cached policies: {e}")
+    return None
 
 
 def save_to_json(data):
@@ -477,33 +504,57 @@ def save_to_html(data):
 def main():
     """
     Main entry point of the script. Does the following:
-    - Fetches all IAM policies.
-    - Filters only those attached to users, groups, or roles.
-    - For each, collects policy document and role assume info.
-    - Exports final output to JSON, CSV, and HTML.
+    - Fetches all IAM policies
+    - Filters only those attached to users, groups, or roles
+    - For each, collects policy document and role assume info
+    - Exports final output to JSON, CSV, and HTML
     """
     output_data = []
-    print("🔍 Fetching all IAM policies...")
-    paginator = iam.get_paginator('list_policies')
+    use_cached_policies = True  # Set to True to use saved list of attached policies
     all_policies = []
-    for page in paginator.paginate(Scope='All'):
-        all_policies.extend(page['Policies'])
-    total_policies = len(all_policies)
-    print(f"📊 Found {total_policies} IAM policies. Filtering only attached ones...")
+
+    # Try to load cached policies
+    cached_policies = load_attached_policies_from_file()
+    if use_cached_policies and cached_policies:
+        print("📦 Using cached list of policies")
+        for policy_arn in cached_policies:
+            try:
+                policy_meta = iam.get_policy(PolicyArn=policy_arn)
+                all_policies.append(policy_meta['Policy'])
+            except Exception as e:
+                print(f"[ERROR] Could not fetch policy {policy_arn}: {e}")
+        total_policies = len(all_policies)
+        print(f"📊 Found {total_policies} policies from cache.")
+    else:
+        print("🔍 Fetching all IAM policies...")
+        paginator = iam.get_paginator('list_policies')
+        all_policies = []
+        for page in paginator.paginate(Scope='All'):
+            all_policies.extend(page['Policies'])
+        total_policies = len(all_policies)
+        print(f"📊 Found {total_policies} IAM policies. Filtering only attached ones...")
+
     count = 0
+    policy_arns_with_attachments = []
+
     for i, policy in enumerate(all_policies, 1):
         policy_name = policy['PolicyName']
         policy_arn = policy['Arn']
+
         # Get attached entities
         entities = list_entities_for_policy(policy_arn)
+
         # Skip unattached policies
         if not any(entities.values()):
             if i % 50 == 0 or i == total_policies:
                 print(f"⏳ Processed {i}/{total_policies} policies... (skipping unattached)")
             continue
+
+        policy_arns_with_attachments.append(policy_arn)
         count += 1
         if count % 10 == 0 or i == total_policies:
             print(f"⏳ Processed {i}/{total_policies} policies... found {count} attached so far.")
+
         # Build metadata block
         metadata_block = {
             "Policy Name": policy_name,
@@ -515,18 +566,26 @@ def main():
             },
             "Role Assume Info": {}
         }
+
         # If the policy is attached to one or more roles, fetch their assume info
         if entities['roles']:
             role_assume_data = get_roles_assume_info(entities['roles'])
             metadata_block["Role Assume Info"] = role_assume_data
+
         # Get policy document
         policy_doc = get_policy_details(policy_arn)
+
         # Combine metadata and policy document
         full_entry = {
             "metadata": metadata_block,
             "policy_document": policy_doc
         }
         output_data.append(full_entry)
+
+    # Save policy ARNs with attachments (if not using cache)
+    if not use_cached_policies:
+        save_attached_policies_to_file(policy_arns_with_attachments)
+
     print(f"\n📦 Collected {len(output_data)} attached policies.")
     # Save to multiple formats
     save_to_json(output_data)
